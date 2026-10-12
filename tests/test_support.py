@@ -10,8 +10,13 @@ fixtures = Path(os.environ['SHARE_FIXTURES']) if 'SHARE_FIXTURES' in os.environ 
 
 # release: (state gate offset, register) for misd; channel lists in wifid
 MISD = {'ios12': (0x1182c, 24), 'ios14ipad': (0x11bb8, 25), 'ios15': (0x120a8, 25), 'ios16': (0x141b4, 25),
-        'ios17': (0x137d8, 25), 'ios17ipad': (0x14308, 25)}
-WIFID = {'ios12': 1, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0}
+        'ios17': (0x137d8, 25), 'ios17ipad': (0x14308, 25),
+        'ios18ipad': (0x13964, 27)}
+# iOS 18 Settings: __text (file offset, address, size), the cellular-data and
+# personal-hotspot accessor stubs, the expected call, and __got (address, size).
+SETTINGS = {'ios18ipad': ((0x3b88, 0x100003b88, 0x10d81c), 0x1001139d8, 0x100113a2c, 0x100047454,
+                          (0x100154000, 0x3830))}
+WIFID = {'ios12': 1, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0, 'ios18ipad': 0}
 
 CHECK = r'''#include "share_support.h"
 #include <assert.h>
@@ -63,6 +68,15 @@ int main(int argc, char **argv) {
     fseek(f, 0, SEEK_END); size_t n = ftell(f); rewind(f);
     void *b = malloc(n); assert(fread(b, 1, n, f) == n); fclose(f);
     if (argv[1][0] == 'w') { size_t offset; printf("%u\n", share_channel_lists(b, n, &offset)); return 0; }
+    if (argv[1][0] == 's') {  /* text-offset text-vmaddr text-size data-stub hotspot-stub stub-offset stub-vmaddr */
+        unsigned long long v[7];
+        for (int i = 0; i < 7; i++) v[i] = strtoull(argv[3 + i], NULL, 16);
+        size_t site = 0;
+        unsigned found = share_hotspot_data_sites((const uint32_t *)((char *)b + v[0]), v[2] / 4, v[1], v[3], v[4], &site);
+        uint64_t slot = share_stub_slot((const uint32_t *)((char *)b + v[5]), v[6]);
+        printf("%u %llx %llx\n", found, (unsigned long long)(v[1] + site * 4), (unsigned long long)slot);
+        return 0;
+    }
     size_t site = 0; int dest = 0;
     unsigned count = share_patch_sites(b, n / 4, &site, &dest);
     size_t request = 0; uint32_t patched[4] = {0};
@@ -90,6 +104,15 @@ with tempfile.TemporaryDirectory() as tmp:
         doubled.write_bytes(path.read_bytes() + struct.pack('<4I', 201, 201, 202, 203))
         assert run('m', doubled)[3] == b'2'
         print('PASS', release, 'misd recognized; a duplicate mode table is rejected')
+    for release, (text, data_stub, hotspot_stub, expected, got) in SETTINGS.items():
+        path = fixtures / release / 'Preferences' if fixtures else None
+        if not path or not path.exists():
+            print('SKIP', release, 'Settings'); continue
+        args = [hex(x) for x in (text[0], text[1], text[2], data_stub, hotspot_stub, data_stub - text[1] + text[0], data_stub)]
+        found, site, slot = subprocess.check_output([str(tmp / 'check'), 's', str(path), *args]).split()
+        assert int(found) == 1 and int(site, 16) == expected, (release, found, site)
+        assert got[0] <= int(slot, 16) < got[0] + got[1], (release, slot)
+        print('PASS', release, 'Settings hotspot cellular-data call found')
     for release, lists in WIFID.items():
         path = fixtures / release / 'wifid' if fixtures else None
         if not path or not path.exists():

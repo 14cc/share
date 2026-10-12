@@ -6,7 +6,7 @@ Install it, open Settings › Personal Hotspot, set a password and turn it on. D
 
 ## Compatibility
 
-iOS 12 and up, on iPhone and iPad, rootful or rootless. Wi-Fi-only iPads work too.
+iOS 12 and up, on iPhone and iPad, rootful or rootless. Wi-Fi-only iPads work too, including iOS 18.
 
 Tested on iOS 12.5.8, 15.8.4, 15.8.5, 15.8.6, 16.3, 16.6.1, 17.6.1 and 17.7.11.
 
@@ -17,6 +17,8 @@ Newer iOS picks the band on its own, and Maximize Compatibility in Settings move
 ## Problems
 
 If Share doesn't work on your device, it writes one report to `/var/mobile/Documents/Share-Report.json`. Open it in Filza and send it to me. The report holds no passwords, network names or addresses.
+
+Share also keeps `/var/mobile/Library/Share/status.json` up to date with what it did in `misd` and the last hotspot states. If that file is missing, Share isn't loading into `misd`.
 
 ## How it works
 

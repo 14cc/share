@@ -35,6 +35,7 @@
 #define SHARE_DIR "/var/mobile/Library/Share"
 #define SHARE_REPORTED SHARE_DIR "/reported"
 #define SHARE_RADIO SHARE_DIR "/radio.json"
+#define SHARE_STATUS SHARE_DIR "/status.json"
 #define SHARE_REPORT "/var/mobile/Documents/Share-Report.json"
 #define MIS_KEY CFSTR("com.apple.MobileInternetSharing")
 #define MIS_STATE_RESET 1020
@@ -427,7 +428,31 @@ static void check_hotspot(void) {
         report(@"hotspot error", [NSString stringWithFormat:@"misd reported error %@", state[@"Errnum"]]);
 }
 
+/* What Share did in misd and the last hotspot states, readable in Filza
+ * without scutil. Rewritten on every change. */
+static void write_status(void) {
+    static NSMutableArray *history;
+    if (!history) history = [NSMutableArray array];
+    NSDictionary *state = hotspot_state();
+    /* misd also republishes when only the host count changes. */
+    NSDictionary *entry = @{@"State": state[@"State"] ?: @0, @"Reason": state[@"Reason"] ?: @0,
+                            @"Errnum": state[@"Errnum"] ?: @0};
+    NSMutableDictionary *last = [history.lastObject mutableCopy];
+    [last removeObjectForKey:@"date"];
+    if (state.count && ![last isEqual:entry]) {
+        NSMutableDictionary *dated = [entry mutableCopy];
+        dated[@"date"] = NSDate.date.description;
+        [history addObject:dated];
+        if (history.count > 8) [history removeObjectAtIndex:0];
+    }
+    write_mobile_file(SHARE_STATUS, json(@{
+        @"share": @SHARE_VERSION, @"misd": binary[@"uuid"] ?: @"unknown",
+        @"compatible": @(compatible), @"failure": failure, @"patch": patch_method, @"hook": hook_method,
+        @"localMode": @(atomic_load(&local_mode)), @"wifiOnly": @(wifi_only), @"states": history}));
+}
+
 static void misd_state_changed(CFTypeRef s, CFArrayRef keys, void *info) {
+    write_status();
     if (check_pending) return;
     check_pending = YES;
     /* Startup passes through the unavailable states; judge once settled. */
@@ -440,6 +465,7 @@ static void start_misd(void) {
     dispatch_async(queue, ^{
         @autoreleasepool {
             @try {
+                write_status();
                 if (!compatible) { report(@"unsupported", failure); return; }
                 watch_store(misd_state_changed);
                 misd_state_changed(NULL, NULL, NULL);
@@ -569,8 +595,43 @@ static void request_off(void) {
     if (state == MIS_STATE_RESET) ((void (*)(id, SEL, int))objc_msgSend)(manager, set, MIS_STATE_OFF);
 }
 
+/* iOS 18 Settings builds the row in Swift and checks cellular-data through
+ * MobileGestalt_get_cellularDataCapability; personal-hotspot already reads
+ * true through the answer hook. Only the hotspot row's call becomes
+ * `mov w0, #1`, so no other cellular row appears. */
+static uint64_t stub_for(const struct mach_header_64 *header, const void *function) {
+    const void *plain = ptrauth_strip(function, ptrauth_key_function_pointer);
+    const char *names[] = {"__stubs", "__auth_stubs"};
+    for (int n = 0; n < 2; n++) {
+        unsigned long size = 0;
+        uint8_t *data = getsectiondata(header, "__TEXT", names[n], &size);
+        for (unsigned long offset = 0; data && offset + 8 <= size; offset += 4) {
+            uint64_t slot = share_stub_slot((const uint32_t *)(data + offset), (uint64_t)(data + offset));
+            if (slot && ptrauth_strip(*(void **)slot, ptrauth_key_asia) == plain) return (uint64_t)(data + offset);
+        }
+    }
+    return 0;
+}
+
+static void enable_hotspot_row(void) {
+    const struct mach_header_64 *header = main_image(NULL);
+    void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
+    void *data = gestalt ? dlsym(gestalt, "MobileGestalt_get_cellularDataCapability") : NULL;
+    void *hotspot = gestalt ? dlsym(gestalt, "MobileGestalt_get_personalHotspotCapability") : NULL;
+    if (!header || !data || !hotspot) return;
+    uint64_t data_stub = stub_for(header, data), hotspot_stub = stub_for(header, hotspot);
+    unsigned long size = 0;
+    uint8_t *text = getsectiondata(header, "__TEXT", "__text", &size);
+    size_t site = 0;
+    if (!data_stub || !hotspot_stub || !text ||
+        share_hotspot_data_sites((const uint32_t *)text, size / 4, (uint64_t)text, data_stub, hotspot_stub, &site) != 1)
+        return;
+    write_instruction(text + site * 4, 0x52800020);
+}
+
 static void start_settings(void) {
     if (has_baseband()) return;
+    enable_hotspot_row();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool { @try { request_off(); } @catch (id e) {} } });
     void *preferences = dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_NOW);
     void *loader = preferences ? dlsym(preferences, "SpecifiersFromPlist") : NULL;

@@ -77,6 +77,45 @@ static int64_t share_answer_branch(const uint32_t *w) {
     return imm * 4;
 }
 
+/* `bl` at `pc`: its target, or 0. */
+static uint64_t share_bl_target(uint32_t ins, uint64_t pc) {
+    if ((ins & 0xfc000000u) != 0x94000000u) return 0;
+    int64_t imm = ins & 0x03ffffffu;
+    if (imm & 0x02000000) imm -= 0x04000000;
+    return pc + (uint64_t)(imm * 4);
+}
+
+/* A stub loads its function pointer from a slot: `adrp xN` then
+ * `ldr x16, [xN, #off]` (arm64) or `add x17, x17, #off` (arm64e).
+ * Returns the slot address, or 0. */
+static uint64_t share_stub_slot(const uint32_t *w, uint64_t pc) {
+    if ((w[0] & 0x9f000000u) != 0x90000000u) return 0;
+    int64_t imm = ((w[0] >> 29) & 3) | (((int64_t)(w[0] >> 5) & 0x7ffff) << 2);
+    if (imm & (1 << 20)) imm -= 1 << 21;
+    uint64_t page = (pc & ~0xfffull) + (uint64_t)(imm << 12);
+    unsigned reg = w[0] & 31;
+    if ((w[1] & 0xffc00000u) == 0xf9400000u && ((w[1] >> 5) & 31) == reg)
+        return page + ((w[1] >> 10) & 0xfff) * 8;
+    if ((w[1] & 0xffc00000u) == 0x91000000u && ((w[1] >> 5) & 31) == reg)
+        return page + ((w[1] >> 10) & 0xfff);
+    return 0;
+}
+
+/* iOS 18 Settings decides the Personal Hotspot row with two Swift key-path
+ * getters placed together: one calls the cellular-data accessor, the next the
+ * personal-hotspot accessor. Other rows check cellular-data alone. Finds the
+ * cellular-data call that precedes the only personal-hotspot call. */
+static unsigned share_hotspot_data_sites(const uint32_t *w, size_t count, uint64_t base,
+                                         uint64_t data_stub, uint64_t hotspot_stub, size_t *site) {
+    unsigned found = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (share_bl_target(w[i], base + i * 4) != hotspot_stub) continue;
+        for (size_t j = i; j-- > 0 && i - j <= 16;)
+            if (share_bl_target(w[j], base + j * 4) == data_stub) { *site = j; found++; break; }
+    }
+    return found;
+}
+
 /* misd's operating-mode table; 203 is Apple's local network with DHCP. */
 static unsigned share_mode_tables(const void *bytes, size_t size) {
     const uint32_t table[] = {201, 201, 202, 203};
