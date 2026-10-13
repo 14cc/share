@@ -85,15 +85,22 @@ static uint64_t share_bl_target(uint32_t ins, uint64_t pc) {
     return pc + (uint64_t)(imm * 4);
 }
 
+/* `adrp xN` at `pc`: the page it loads, with N in *reg, or 0. */
+static uint64_t share_adrp(uint32_t ins, uint64_t pc, unsigned *reg) {
+    if ((ins & 0x9f000000u) != 0x90000000u) return 0;
+    int64_t imm = ((ins >> 29) & 3) | (((int64_t)(ins >> 5) & 0x7ffff) << 2);
+    if (imm & (1 << 20)) imm -= 1 << 21;
+    *reg = ins & 31;
+    return (pc & ~0xfffull) + (uint64_t)(imm << 12);
+}
+
 /* A stub loads its function pointer from a slot: `adrp xN` then
  * `ldr x16, [xN, #off]` (arm64) or `add x17, x17, #off` (arm64e).
  * Returns the slot address, or 0. */
 static uint64_t share_stub_slot(const uint32_t *w, uint64_t pc) {
-    if ((w[0] & 0x9f000000u) != 0x90000000u) return 0;
-    int64_t imm = ((w[0] >> 29) & 3) | (((int64_t)(w[0] >> 5) & 0x7ffff) << 2);
-    if (imm & (1 << 20)) imm -= 1 << 21;
-    uint64_t page = (pc & ~0xfffull) + (uint64_t)(imm << 12);
-    unsigned reg = w[0] & 31;
+    unsigned reg;
+    uint64_t page = share_adrp(w[0], pc, &reg);
+    if (!page) return 0;
     if ((w[1] & 0xffc00000u) == 0xf9400000u && ((w[1] >> 5) & 31) == reg)
         return page + ((w[1] >> 10) & 0xfff) * 8;
     if ((w[1] & 0xffc00000u) == 0x91000000u && ((w[1] >> 5) & 31) == reg)
@@ -101,17 +108,77 @@ static uint64_t share_stub_slot(const uint32_t *w, uint64_t pc) {
     return 0;
 }
 
-/* iOS 18 Settings decides the Personal Hotspot row with two Swift key-path
- * getters placed together: one calls the cellular-data accessor, the next the
- * personal-hotspot accessor. Other rows check cellular-data alone. Finds the
- * cellular-data call that precedes the only personal-hotspot call. */
-static unsigned share_hotspot_data_sites(const uint32_t *w, size_t count, uint64_t base,
-                                         uint64_t data_stub, uint64_t hotspot_stub, size_t *site) {
+/* `adrp x0` then `add x0, x0, #off` at `pc`: the address, or 0. */
+static uint64_t share_x0_address(const uint32_t *w, uint64_t pc) {
+    unsigned reg;
+    uint64_t page = share_adrp(w[0], pc, &reg);
+    if (!page || reg != 0 || (w[1] & 0xffc003ffu) != 0x91000000u) return 0;
+    return page + ((w[1] >> 10) & 0xfff);
+}
+
+/* The two instructions that load `target` into x0 at `pc`. */
+static void share_x0_load(uint64_t pc, uint64_t target, uint32_t out[2]) {
+    int64_t pages = ((int64_t)(target & ~0xfffull) - (int64_t)(pc & ~0xfffull)) >> 12;
+    out[0] = 0x90000000u | (uint32_t)(pages & 3) << 29 | (uint32_t)((pages >> 2) & 0x7ffff) << 5;
+    out[1] = 0x91000000u | (uint32_t)(target & 0xfff) << 10;
+}
+
+/* iOS 18 Settings reads each MobileGestalt capability through a Swift
+ * key-path getter:
+ *   stp; stp; add x29; mov x19, x8; ldr x0, [x0]; bl accessor; strb w0, [x19]
+ * Returns the getter that calls `stub`, or 0 unless exactly one does. */
+static uint64_t share_capability_getter(const uint32_t *w, size_t count, uint64_t base, uint64_t stub) {
+    uint64_t getter = 0;
     unsigned found = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (share_bl_target(w[i], base + i * 4) != hotspot_stub) continue;
-        for (size_t j = i; j-- > 0 && i - j <= 16;)
-            if (share_bl_target(w[j], base + j * 4) == data_stub) { *site = j; found++; break; }
+    if (!stub) return 0;
+    for (size_t i = 5; i + 1 < count; i++)
+        if (w[i - 2] == 0xaa0803f3u && w[i - 1] == 0xf9400000u && w[i + 1] == 0x39000260u &&
+            share_bl_target(w[i], base + i * 4) == stub) {
+            getter = base + (i - 5) * 4;
+            found++;
+        }
+    return found == 1 ? getter : 0;
+}
+
+/* A key-path pattern points at its getter with a 32-bit relative offset.
+ * Returns where that offset sits, or 0 unless exactly one does. */
+static uint64_t share_keypath_reference(const uint8_t *bytes, size_t size, uint64_t base, uint64_t getter) {
+    uint64_t reference = 0;
+    unsigned found = 0;
+    for (size_t i = 0; i + 4 <= size; i += 4) {
+        int32_t offset;
+        memcpy(&offset, bytes + i, 4);
+        if (base + i + (uint64_t)(int64_t)offset == getter) {
+            reference = base + i;
+            found++;
+        }
+    }
+    return found == 1 ? reference : 0;
+}
+
+/* Settings shows the Personal Hotspot row when cellular-data and
+ * personal-hotspot both hold; the Cellular row needs cellular-data alone.
+ * Each requirement is built by `adrp x0; add x0; bl swift_getKeyPath`, and a
+ * pattern starts at most 0x20 bytes before its getter reference. Finds the
+ * hotspot row's cellular-data load, and the personal-hotspot pattern to load
+ * there instead, so only that row drops the cellular-data check. */
+static unsigned share_hotspot_requirement(const uint32_t *w, size_t count, uint64_t base, uint64_t keypath_stub,
+                                          uint64_t data_reference, uint64_t hotspot_reference,
+                                          size_t *site, uint64_t *hotspot_pattern) {
+    unsigned found = 0;
+    size_t data = 0;
+    if (!keypath_stub) return 0;
+    for (size_t i = 2; i < count; i++) {
+        if (share_bl_target(w[i], base + i * 4) != keypath_stub) continue;
+        uint64_t pattern = share_x0_address(w + i - 2, base + (i - 2) * 4);
+        if (pattern && pattern < data_reference && data_reference - pattern <= 0x20) {
+            data = i;
+        } else if (pattern && pattern < hotspot_reference && hotspot_reference - pattern <= 0x20 &&
+                   data && i - data <= 16) {
+            *site = data - 2;
+            *hotspot_pattern = pattern;
+            found++;
+        }
     }
     return found;
 }

@@ -533,15 +533,21 @@ static void start_wifid(void) {
 /* ── Settings ─────────────────────────────────────────────────────
  * Wi-Fi-only models lack the personal-hotspot capability, so Settings hides
  * Personal Hotspot. MGCopyAnswer is `mov x1, #0; b answer`, and
- * MGGetBoolAnswer calls the same answer function, so one hook covers both. */
+ * MGGetBoolAnswer calls the same answer function, so one hook covers both.
+ * iOS 18's MobileGestalt_get_personalHotspotCapability asks by the key's
+ * hashed name. */
 static CFTypeRef (*answer_original)(CFStringRef, void *);
+
+static BOOL hotspot_key(CFStringRef key) {
+    return key && CFGetTypeID(key) == CFStringGetTypeID() &&
+        (CFEqual(key, CFSTR("personal-hotspot")) || CFEqual(key, CFSTR("wlxZYdEZITDTzgs/OnnV+Q")));
+}
 
 /* MGGetBoolAnswer passes a pointer the answer function fills with the value's
  * type, so the original always runs and only the value is replaced. */
 static CFTypeRef answer(CFStringRef key, void *options) {
     CFTypeRef value = answer_original(key, options);
-    if (!value || CFGetTypeID(value) != CFBooleanGetTypeID() || !key ||
-        CFGetTypeID(key) != CFStringGetTypeID() || !CFEqual(key, CFSTR("personal-hotspot")))
+    if (!value || CFGetTypeID(value) != CFBooleanGetTypeID() || !hotspot_key(key))
         return value;
     CFRelease(value);
     return CFRetain(kCFBooleanTrue);
@@ -595,10 +601,9 @@ static void request_off(void) {
     if (state == MIS_STATE_RESET) ((void (*)(id, SEL, int))objc_msgSend)(manager, set, MIS_STATE_OFF);
 }
 
-/* iOS 18 Settings builds the row in Swift and checks cellular-data through
- * MobileGestalt_get_cellularDataCapability; personal-hotspot already reads
- * true through the answer hook. Only the hotspot row's call becomes
- * `mov w0, #1`, so no other cellular row appears. */
+/* iOS 18 Settings builds the row in Swift and requires cellular-data and
+ * personal-hotspot. The hotspot row's cellular-data requirement is rewritten
+ * to load its personal-hotspot one, so no other cellular row appears. */
 static uint64_t stub_for(const struct mach_header_64 *header, const void *function) {
     const void *plain = ptrauth_strip(function, ptrauth_key_function_pointer);
     const char *names[] = {"__stubs", "__auth_stubs"};
@@ -618,15 +623,28 @@ static void enable_hotspot_row(void) {
     void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
     void *data = gestalt ? dlsym(gestalt, "MobileGestalt_get_cellularDataCapability") : NULL;
     void *hotspot = gestalt ? dlsym(gestalt, "MobileGestalt_get_personalHotspotCapability") : NULL;
-    if (!header || !data || !hotspot) return;
-    uint64_t data_stub = stub_for(header, data), hotspot_stub = stub_for(header, hotspot);
-    unsigned long size = 0;
-    uint8_t *text = getsectiondata(header, "__TEXT", "__text", &size);
+    void *keypath = dlsym(RTLD_DEFAULT, "swift_getKeyPath");
+    if (!header || !data || !hotspot || !keypath) return;
+    unsigned long text_size = 0, const_size = 0;
+    uint8_t *text = getsectiondata(header, "__TEXT", "__text", &text_size);
+    uint8_t *constants = getsectiondata(header, "__TEXT", "__const", &const_size);
+    if (!text || !constants) return;
+    const uint32_t *w = (const uint32_t *)text;
+    size_t count = text_size / 4;
+    uint64_t base = (uint64_t)text;
+    uint64_t data_getter = share_capability_getter(w, count, base, stub_for(header, data));
+    uint64_t hotspot_getter = share_capability_getter(w, count, base, stub_for(header, hotspot));
+    uint64_t data_reference = data_getter ? share_keypath_reference(constants, const_size, (uint64_t)constants, data_getter) : 0;
+    uint64_t hotspot_reference = hotspot_getter ? share_keypath_reference(constants, const_size, (uint64_t)constants, hotspot_getter) : 0;
+    uint64_t keypath_stub = stub_for(header, keypath);
     size_t site = 0;
-    if (!data_stub || !hotspot_stub || !text ||
-        share_hotspot_data_sites((const uint32_t *)text, size / 4, (uint64_t)text, data_stub, hotspot_stub, &site) != 1)
+    uint64_t pattern = 0;
+    if (!data_reference || !hotspot_reference || !keypath_stub ||
+        share_hotspot_requirement(w, count, base, keypath_stub, data_reference, hotspot_reference, &site, &pattern) != 1)
         return;
-    write_instruction(text + site * 4, 0x52800020);
+    uint32_t load[2];
+    share_x0_load(base + site * 4, pattern, load);
+    write_instructions(text + site * 4, load, 2);
 }
 
 static void start_settings(void) {

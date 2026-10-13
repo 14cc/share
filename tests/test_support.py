@@ -12,9 +12,11 @@ fixtures = Path(os.environ['SHARE_FIXTURES']) if 'SHARE_FIXTURES' in os.environ 
 MISD = {'ios12': (0x1182c, 24), 'ios14ipad': (0x11bb8, 25), 'ios15': (0x120a8, 25), 'ios16': (0x141b4, 25),
         'ios17': (0x137d8, 25), 'ios17ipad': (0x14308, 25),
         'ios18ipad': (0x13964, 27)}
-# iOS 18 Settings: __text (file offset, address, size), the cellular-data and
-# personal-hotspot accessor stubs, the expected call, and __got (address, size).
-SETTINGS = {'ios18ipad': ((0x3b88, 0x100003b88, 0x10d81c), 0x1001139d8, 0x100113a2c, 0x100047454,
+# iOS 18 Settings: __text and __const (file offset, address, size); the
+# cellular-data, personal-hotspot and swift_getKeyPath stubs; the expected
+# cellular-data load, the personal-hotspot pattern; __got (address, size).
+SETTINGS = {'ios18ipad': ((0x3b88, 0x100003b88, 0x10d81c), (0x1155d0, 0x1001155d0, 0x9bd8),
+                          (0x1001139d8, 0x100113a2c, 0x100114098), 0x10002b264, 0x100116cb8,
                           (0x100154000, 0x3830))}
 WIFID = {'ios12': 1, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0, 'ios18ipad': 0}
 
@@ -53,6 +55,12 @@ static void rules(void) {
     assert(!share_data_plan_signature("i24@0:8@16"));
     assert(!share_data_plan_signature(NULL));
 
+    uint32_t load[2];
+    share_x0_load(0x100002000, 0x100001ff8, load);
+    assert(share_x0_address(load, 0x100002000) == 0x100001ff8);
+    share_x0_load(0x10002b264, 0x100116cb8, load);
+    assert(load[0] == 0xf0000740 && load[1] == 0x9132e000);
+    assert(share_x0_address(load, 0x10002b264) == 0x100116cb8);
     uint32_t out[3];
     struct share_channel all[] = {{1, 6, 0x0a}, {1, 36, 0x12}, {1, 40, 0x12}, {1, 44, 0x12}, {1, 52, 0x112}};
     assert(share_pick_5ghz(all, 5, out) == 3 && out[0] == 36 && out[1] == 40 && out[2] == 44);
@@ -68,13 +76,20 @@ int main(int argc, char **argv) {
     fseek(f, 0, SEEK_END); size_t n = ftell(f); rewind(f);
     void *b = malloc(n); assert(fread(b, 1, n, f) == n); fclose(f);
     if (argv[1][0] == 'w') { size_t offset; printf("%u\n", share_channel_lists(b, n, &offset)); return 0; }
-    if (argv[1][0] == 's') {  /* text-offset text-vmaddr text-size data-stub hotspot-stub stub-offset stub-vmaddr */
-        unsigned long long v[7];
-        for (int i = 0; i < 7; i++) v[i] = strtoull(argv[3 + i], NULL, 16);
-        size_t site = 0;
-        unsigned found = share_hotspot_data_sites((const uint32_t *)((char *)b + v[0]), v[2] / 4, v[1], v[3], v[4], &site);
-        uint64_t slot = share_stub_slot((const uint32_t *)((char *)b + v[5]), v[6]);
-        printf("%u %llx %llx\n", found, (unsigned long long)(v[1] + site * 4), (unsigned long long)slot);
+    if (argv[1][0] == 's') {  /* text off/vm/size, const off/vm/size, data/hotspot/keypath stubs */
+        unsigned long long v[9];
+        for (int i = 0; i < 9; i++) v[i] = strtoull(argv[3 + i], NULL, 16);
+        const uint32_t *text = (const uint32_t *)((char *)b + v[0]);
+        uint64_t data = share_capability_getter(text, v[2] / 4, v[1], v[6]);
+        uint64_t hotspot = share_capability_getter(text, v[2] / 4, v[1], v[7]);
+        uint64_t data_ref = share_keypath_reference((const uint8_t *)b + v[3], v[5], v[4], data);
+        uint64_t hotspot_ref = share_keypath_reference((const uint8_t *)b + v[3], v[5], v[4], hotspot);
+        size_t site = 0; uint64_t pattern = 0; uint32_t load[2] = {0};
+        unsigned found = share_hotspot_requirement(text, v[2] / 4, v[1], v[8], data_ref, hotspot_ref, &site, &pattern);
+        share_x0_load(v[1] + site * 4, pattern, load);
+        uint64_t slot = share_stub_slot((const uint32_t *)((char *)b + v[6] - v[1] + v[0]), v[6]);
+        printf("%u %llx %llx %x %x %llx\n", found, (unsigned long long)(v[1] + site * 4), (unsigned long long)pattern,
+               load[0], load[1], (unsigned long long)slot);
         return 0;
     }
     size_t site = 0; int dest = 0;
@@ -104,15 +119,20 @@ with tempfile.TemporaryDirectory() as tmp:
         doubled.write_bytes(path.read_bytes() + struct.pack('<4I', 201, 201, 202, 203))
         assert run('m', doubled)[3] == b'2'
         print('PASS', release, 'misd recognized; a duplicate mode table is rejected')
-    for release, (text, data_stub, hotspot_stub, expected, got) in SETTINGS.items():
+    for release, (text, const, stubs, expected, pattern, got) in SETTINGS.items():
         path = fixtures / release / 'Preferences' if fixtures else None
         if not path or not path.exists():
             print('SKIP', release, 'Settings'); continue
-        args = [hex(x) for x in (text[0], text[1], text[2], data_stub, hotspot_stub, data_stub - text[1] + text[0], data_stub)]
-        found, site, slot = subprocess.check_output([str(tmp / 'check'), 's', str(path), *args]).split()
-        assert int(found) == 1 and int(site, 16) == expected, (release, found, site)
+        args = [hex(x) for x in (*text, *const, *stubs)]
+        found, site, loaded, adrp, add, slot = subprocess.check_output([str(tmp / 'check'), 's', str(path), *args]).split()
+        assert int(found) == 1 and int(site, 16) == expected and int(loaded, 16) == pattern, (release, found, site, loaded)
+        # The new pair must equal the hotspot requirement's own adrp/add.
+        code = path.read_bytes()
+        hotspot_add = struct.unpack('<I', code[expected - text[1] + text[0] + 0x2c:][:4])[0]
+        assert int(add, 16) == hotspot_add, (release, add, hex(hotspot_add))
+        assert int(adrp, 16) == struct.unpack('<I', code[expected - text[1] + text[0]:][:4])[0]
         assert got[0] <= int(slot, 16) < got[0] + got[1], (release, slot)
-        print('PASS', release, 'Settings hotspot cellular-data call found')
+        print('PASS', release, 'Settings hotspot row cellular-data requirement found')
     for release, lists in WIFID.items():
         path = fixtures / release / 'wifid' if fixtures else None
         if not path or not path.exists():
