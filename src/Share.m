@@ -3,8 +3,9 @@
  * In misd it removes the cellular requirement and asks for Apple's local
  * network mode with DHCP; Apple still creates the network. In wifid, on
  * releases with a fixed 2.4 GHz hotspot channel list, it offers 5 GHz
- * channels when the Wi-Fi driver allows them here. On Wi-Fi-only iPads it
- * also skips misd's wait for a carrier and lists Personal Hotspot in Settings.
+ * channels when the Wi-Fi driver allows them here. On Wi-Fi-only iPads and
+ * cellular devices without a SIM it also skips misd's wait for a carrier and
+ * lists Personal Hotspot in Settings.
  *
  * Anything unrecognized is left untouched. When something goes wrong, a
  * report is written once to Documents/Share-Report.json. */
@@ -188,19 +189,36 @@ struct share_ct_status {
 static int (*ct_original)(id, SEL, struct share_ct_status *);
 static int (*plan_original)(id, SEL, BOOL *);
 static uint64_t (*data_original)(void *, Boolean *);
+static int (*carrier_original)(int, Boolean *);
 static uint64_t (*mode_original)(void *, const char *);
 static CFStringRef (*sim_status)(void);
 static CFStringRef *sim_ready;
-static _Atomic int local_mode, tethering_result = -1;
+static _Atomic int local_mode, tethering_result = -1, carrier_result = -1, carrier_overrides;
 static BOOL compatible, ct_backend, wifi_only;
 static NSString *failure = @"", *signature = @"absent", *plan_signature = @"absent";
 static NSMutableDictionary *binary;
+
+static void *load_telephony(void) {
+    void *telephony = dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
+    sim_status = telephony ? dlsym(telephony, "CTSIMSupportGetSIMStatus") : NULL;
+    sim_ready = telephony ? dlsym(telephony, "kCTSIMSupportSIMStatusReady") : NULL;
+    return telephony;
+}
 
 /* No usable SIM: none, locked, or no baseband at all. */
 static int sim_unusable(void) {
     if (wifi_only) return 1;
     CFStringRef status = sim_status ? sim_status() : NULL;
     return !status || !sim_ready || !*sim_ready || !CFEqual(status, *sim_ready);
+}
+
+/* CoreTelephony states that no SIM is usable (not inserted, locked).
+ * Unlike sim_unusable, an unanswered query does not count, so a SIM device
+ * whose CoreTelephony is still starting keeps its carrier check. */
+static int sim_absent(void) {
+    if (wifi_only) return 1;
+    CFStringRef status = sim_status ? sim_status() : NULL;
+    return status && sim_ready && *sim_ready && !CFEqual(status, *sim_ready);
 }
 
 /* Without cellular service the query reports no connection, or fails on
@@ -238,6 +256,19 @@ static uint64_t data_status(void *connection, Boolean *enabled) {
     return 0;
 }
 
+/* iOS 12 misd's own carrier check fails with 45 when CoreTelephony has no
+ * data connection to tether, and misd then stays in RESET. Its side effects
+ * (the host limit) still run; without a usable SIM it reports success and an
+ * enabled data plan. Found by @t-klinger-cmd on an iPad mini 2 Cellular. */
+static int carrier_status(int request, Boolean *enabled) {
+    int result = carrier_original(request, enabled);
+    atomic_store(&carrier_result, result);
+    if (!compatible || !enabled || !sim_unusable()) return result;
+    *enabled = 1;
+    atomic_fetch_add(&carrier_overrides, 1);
+    return 0;
+}
+
 static uint64_t mode_get(void *dictionary, const char *key) {
     uint64_t value = mode_original(dictionary, key);
     if (!key || strcmp(key, "opMode") || (value != 200 && value != 201)) return value;
@@ -269,6 +300,27 @@ static NSString *image_uuid(const struct mach_header_64 *header) {
     return @"unknown";
 }
 
+/* The image's LC_FUNCTION_STARTS data, as mapped in __LINKEDIT. */
+static const uint8_t *function_starts(const struct mach_header_64 *header, size_t *size) {
+    const uint8_t *cursor = (const uint8_t *)(header + 1), *end = cursor + header->sizeofcmds;
+    const struct linkedit_data_command *starts = NULL;
+    const struct segment_command_64 *text = NULL, *linkedit = NULL;
+    for (uint32_t i = 0; i < header->ncmds && cursor + sizeof(struct load_command) <= end; i++) {
+        const struct load_command *command = (const void *)cursor;
+        if (command->cmdsize < sizeof *command || cursor + command->cmdsize > end) break;
+        if (command->cmd == LC_FUNCTION_STARTS) starts = (const void *)cursor;
+        if (command->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)cursor)->segname, "__TEXT"))
+            text = (const void *)cursor;
+        if (command->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)cursor)->segname, "__LINKEDIT"))
+            linkedit = (const void *)cursor;
+        cursor += command->cmdsize;
+    }
+    if (!starts || !text || !linkedit || starts->dataoff < linkedit->fileoff ||
+        starts->dataoff + starts->datasize > linkedit->fileoff + linkedit->filesize) return NULL;
+    *size = starts->datasize;
+    return (const uint8_t *)header + (linkedit->vmaddr - text->vmaddr) + (starts->dataoff - linkedit->fileoff);
+}
+
 static void install(void) {
     NSString *path = @"";
     const struct mach_header_64 *header = main_image(&path);
@@ -293,9 +345,7 @@ static void install(void) {
         binary[@"stateGateInstruction"] = @(((uint32_t *)text)[site]);
     }
 
-    void *telephony = dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
-    sim_status = telephony ? dlsym(telephony, "CTSIMSupportGetSIMStatus") : NULL;
-    sim_ready = telephony ? dlsym(telephony, "kCTSIMSupportSIMStatusReady") : NULL;
+    void *telephony = load_telephony();
     Class client = objc_getClass("misCTClientSharedInstance");
     Method method = client ? class_getInstanceMethod(client, sel_registerName("getTetheringStatus:")) : NULL;
     const char *types = method ? method_getTypeEncoding(method) : NULL;
@@ -310,7 +360,7 @@ static void install(void) {
     if (!permission) { failure = @"Cellular check not recognized"; return; }
     if (!mode_lookup) { failure = @"Hotspot mode lookup not found"; return; }
     if (!write_instruction(text + site * 4, share_patched_instruction(destination))) { failure = @"Could not patch misd"; return; }
-    if (wifi_only && requests == 1 && write_instructions(text + request_site * 4, request_patch, 4)) {
+    if (requests == 1 && sim_absent() && write_instructions(text + request_site * 4, request_patch, 4)) {
         binary[@"requestGateOffset"] = @((uintptr_t)(text + request_site * 4) - (uintptr_t)header);
         reset_saved_state();
     }
@@ -320,6 +370,12 @@ static void install(void) {
     if (!compatible) { failure = @"Could not adapt the cellular check"; return; }
     void *data_check = !ct_backend && telephony ? dlsym(telephony, "_CTServerConnectionGetCellularDataIsEnabled") : NULL;
     if (data_check) hook_function(data_check, (void *)data_status, (void **)&data_original);
+    size_t starts_size = 0;
+    const uint8_t *starts = ct_backend ? NULL : function_starts(header, &starts_size);
+    int64_t message = starts ? share_find(text, size, "carrier service is %savailable") : -1;
+    uint64_t carrier = message > 0 ? share_carrier_check((const uint32_t *)text, size / 4, starts, starts_size, (uint64_t)message) : 0;
+    if (carrier && hook_function(text + carrier, (void *)carrier_status, (void **)&carrier_original))
+        binary[@"carrierCheckOffset"] = @(carrier);
     Method plan = ct_backend ? class_getInstanceMethod(client, sel_registerName("isDataPlanEnabled:")) : NULL;
     const char *plan_types = plan ? method_getTypeEncoding(plan) : NULL;
     if (plan_types) plan_signature = @(plan_types);
@@ -364,7 +420,7 @@ static NSArray *hotspot_classes(void) {
     Class *all = objc_copyClassList(&count);
     for (unsigned i = 0; i < count; i++) {
         const char *name = class_getName(all[i]);
-        if (strncasecmp(name, "mis", 3)) continue;
+        if (strncmp(name, "mis", 3) && strcmp(name, "MISManager")) continue;
         unsigned methods_count = 0;
         Method *methods = class_copyMethodList(all[i], &methods_count);
         NSMutableArray *list = [NSMutableArray array];
@@ -401,6 +457,8 @@ static void report(NSString *kind, NSString *detail) {
                      @"cellularCheck": ct_backend ? @"CoreTelephony" : @"SIM status",
                      @"tetheringStatusSignature": signature, @"tetheringStatusResult": @(atomic_load(&tethering_result)),
                      @"dataPlanSignature": plan_signature, @"dataPlanHook": @(plan_original != NULL || data_original != NULL),
+                     @"carrierCheckHook": @(carrier_original != NULL), @"carrierCheckResult": @(atomic_load(&carrier_result)),
+                     @"carrierCheckOverrides": @(atomic_load(&carrier_overrides)),
                      @"localMode": @(atomic_load(&local_mode)), @"patch": patch_method, @"hook": hook_method,
                      @"hookFrameworks": @{@"MSHookFunction": @(hook_symbol("MSHookFunction") != NULL),
                                           @"MSHookMemory": @(hook_symbol("MSHookMemory") != NULL),
@@ -448,7 +506,8 @@ static void write_status(void) {
     write_mobile_file(SHARE_STATUS, json(@{
         @"share": @SHARE_VERSION, @"misd": binary[@"uuid"] ?: @"unknown",
         @"compatible": @(compatible), @"failure": failure, @"patch": patch_method, @"hook": hook_method,
-        @"localMode": @(atomic_load(&local_mode)), @"wifiOnly": @(wifi_only), @"states": history}));
+        @"localMode": @(atomic_load(&local_mode)), @"wifiOnly": @(wifi_only),
+        @"carrierCheckOverrides": @(atomic_load(&carrier_overrides)), @"states": history}));
 }
 
 static void misd_state_changed(CFTypeRef s, CFArrayRef keys, void *info) {
@@ -587,7 +646,8 @@ static BOOL capabilities(NSArray *required) {
 }
 
 /* iOS 12 misd leaves RESET only when a client asks for a state; on cellular
- * models a carrier event does it. A restored Wi-Fi-only iPad has neither, and
+ * models a carrier event does it. A restored Wi-Fi-only iPad, or a cellular
+ * one without a SIM, has neither, and
  * Settings hides Personal Hotspot in RESET. Ask for OFF, as the switch would. */
 static void request_off(void) {
     dlopen("/System/Library/PreferenceBundles/WirelessModemSettings.bundle/WirelessModemSettings", RTLD_NOW);
@@ -647,8 +707,12 @@ static void enable_hotspot_row(void) {
     write_instructions(text + site * 4, load, 2);
 }
 
+/* Cellular models without a SIM get no carrier event either, so they take
+ * the Wi-Fi-only path too; on them the capability edits change nothing. */
 static void start_settings(void) {
-    if (has_baseband()) return;
+    wifi_only = !has_baseband();
+    load_telephony();
+    if (!sim_absent()) return;
     enable_hotspot_row();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool { @try { request_off(); } @catch (id e) {} } });
     void *preferences = dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_NOW);

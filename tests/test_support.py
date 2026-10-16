@@ -18,6 +18,8 @@ MISD = {'ios12': (0x1182c, 24), 'ios14ipad': (0x11bb8, 25), 'ios15': (0x120a8, 2
 SETTINGS = {'ios18ipad': ((0x3b88, 0x100003b88, 0x10d81c), (0x1155d0, 0x1001155d0, 0x9bd8),
                           (0x1001139d8, 0x100113a2c, 0x100114098), 0x10002b264, 0x100116cb8,
                           (0x100154000, 0x3830))}
+# iOS 12 misd's carrier check (offset); later releases ask an Objective-C client.
+CARRIER = {'ios12': 0xb910, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0, 'ios18ipad': 0}
 WIFID = {'ios12': 1, 'ios14ipad': 0, 'ios15': 0, 'ios16': 0, 'ios17': 0, 'ios18ipad': 0}
 
 CHECK = r'''#include "share_support.h"
@@ -61,6 +63,14 @@ static void rules(void) {
     share_x0_load(0x10002b264, 0x100116cb8, load);
     assert(load[0] == 0xf0000740 && load[1] == 0x9132e000);
     assert(share_x0_address(load, 0x10002b264) == 0x100116cb8);
+    uint8_t starts[] = {0x80, 0x01, 0x40, 0x10, 0};  /* 0x80, 0xc0, 0xd0 */
+    uint64_t end = 0;
+    assert(share_function_start(starts, sizeof starts, 0xc4, &end) == 0xc0 && end == 0xd0);
+    assert(share_function_start(starts, sizeof starts, 0xd4, &end) == 0 && end == 0);
+    assert(share_function_start(starts, sizeof starts, 0x10, &end) == 0 && end == 0x80);
+    uint32_t refs[] = {0x10000041, 0x90000002, 0x91002042};  /* adr x1, #8; adrp x2, 0; add x2, x2, #8 */
+    size_t first = 0, last = 0;
+    assert(share_references(refs, 3, 0x1000, 0x1008, &first, &last) == 2 && first == 0 && last == 1);
     uint32_t out[3];
     struct share_channel all[] = {{1, 6, 0x0a}, {1, 36, 0x12}, {1, 40, 0x12}, {1, 44, 0x12}, {1, 52, 0x112}};
     assert(share_pick_5ghz(all, 5, out) == 3 && out[0] == 36 && out[1] == 40 && out[2] == 44);
@@ -75,6 +85,12 @@ int main(int argc, char **argv) {
     FILE *f = fopen(argv[2], "rb"); assert(f);
     fseek(f, 0, SEEK_END); size_t n = ftell(f); rewind(f);
     void *b = malloc(n); assert(fread(b, 1, n, f) == n); fclose(f);
+    if (argv[1][0] == 'c') {  /* function starts file offset and size */
+        int64_t message = share_find(b, n, "carrier service is %savailable");
+        size_t starts = strtoull(argv[3], NULL, 16), starts_size = strtoull(argv[4], NULL, 16);
+        printf("%llx\n", (unsigned long long)(message > 0 ? share_carrier_check(b, n / 4, (uint8_t *)b + starts, starts_size, message) : 0));
+        return 0;
+    }
     if (argv[1][0] == 'w') { size_t offset; printf("%u\n", share_channel_lists(b, n, &offset)); return 0; }
     if (argv[1][0] == 's') {  /* text off/vm/size, const off/vm/size, data/hotspot/keypath stubs */
         unsigned long long v[9];
@@ -133,6 +149,16 @@ with tempfile.TemporaryDirectory() as tmp:
         assert int(adrp, 16) == struct.unpack('<I', code[expected - text[1] + text[0]:][:4])[0]
         assert got[0] <= int(slot, 16) < got[0] + got[1], (release, slot)
         print('PASS', release, 'Settings hotspot row cellular-data requirement found')
+    for release, expected in CARRIER.items():
+        path = fixtures / release / 'misd' if fixtures else None
+        if not path or not path.exists():
+            print('SKIP', release, 'carrier check'); continue
+        load = subprocess.check_output(['otool', '-l', str(path)], text=True).split('LC_FUNCTION_STARTS')[1]
+        fields = dict(line.split()[:2] for line in load.splitlines()[1:4])
+        found = int(subprocess.check_output([str(tmp / 'check'), 'c', str(path),
+                    hex(int(fields['dataoff'])), hex(int(fields['datasize']))]).strip(), 16)
+        assert found == expected, (release, hex(found))
+        print('PASS', release, 'carrier check', hex(found) if found else 'absent')
     for release, lists in WIFID.items():
         path = fixtures / release / 'wifid' if fixtures else None
         if not path or not path.exists():

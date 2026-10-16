@@ -36,7 +36,7 @@ static uint32_t share_patched_instruction(int destination) {
 
 /* iOS 14's second gate: misd leaves RESET (1020) for AUTH_UNKNOWN (1021) only
  * when a client asked for authorization, and the carrier's answer then moves
- * it to OFF (1022). Wi-Fi-only models have no client and no carrier.
+ * it to OFF (1022). Wi-Fi-only models and SIM-less phones have no carrier.
  *   and  wD, wAVAILABLE, wREQUESTED
  *   tst  wD, wC
  *   mov  wX, #0x3fc
@@ -192,11 +192,79 @@ static unsigned share_mode_tables(const void *bytes, size_t size) {
     return count;
 }
 
-static int share_contains(const void *bytes, size_t size, const char *needle) {
+/* Offset of the C string `needle`, or -1. */
+static int64_t share_find(const void *bytes, size_t size, const char *needle) {
     size_t n = strlen(needle) + 1;
-    if (n > size) return 0;
+    if (n > size) return -1;
     for (size_t i = 0; i + n <= size; i++)
-        if (!memcmp((const char *)bytes + i, needle, n)) return 1;
+        if (!memcmp((const char *)bytes + i, needle, n)) return (int64_t)i;
+    return -1;
+}
+
+static int share_contains(const void *bytes, size_t size, const char *needle) {
+    return share_find(bytes, size, needle) >= 0;
+}
+
+/* `adr xN` at `pc`: the address it loads, or 0. */
+static uint64_t share_adr(uint32_t ins, uint64_t pc) {
+    if ((ins & 0x9f000000u) != 0x10000000u) return 0;
+    int64_t imm = ((ins >> 29) & 3) | (((int64_t)(ins >> 5) & 0x7ffff) << 2);
+    if (imm & (1 << 20)) imm -= 1 << 21;
+    return pc + (uint64_t)imm;
+}
+
+/* Instructions that load `target`: `adr`, or `adrp` then `add` on the same
+ * register. Returns how many, with the first and last index. */
+static unsigned share_references(const uint32_t *w, size_t count, uint64_t base, uint64_t target,
+                                 size_t *first, size_t *last) {
+    unsigned found = 0;
+    for (size_t i = 0; i < count; i++) {
+        unsigned reg;
+        uint64_t page = i + 1 < count ? share_adrp(w[i], base + i * 4, &reg) : 0;
+        int hit = share_adr(w[i], base + i * 4) == target ||
+            (page && (w[i + 1] & 0xffc00000u) == 0x91000000u && ((w[i + 1] >> 5) & 31) == reg &&
+             (w[i + 1] & 31) == reg && page + ((w[i + 1] >> 10) & 0xfff) == target);
+        if (!hit) continue;
+        if (!found) *first = i;
+        *last = i;
+        found++;
+    }
+    return found;
+}
+
+/* LC_FUNCTION_STARTS: ULEB128 deltas from the start of __TEXT, ending at 0.
+ * Returns the start of the function holding `offset` and, in *end, the next
+ * start, or 0. */
+static uint64_t share_function_start(const uint8_t *starts, size_t size, uint64_t offset, uint64_t *end) {
+    uint64_t address = 0, start = 0;
+    size_t i = 0;
+    while (i < size) {
+        uint64_t delta = 0;
+        unsigned shift = 0;
+        do delta |= (uint64_t)(starts[i] & 0x7f) << shift, shift += 7;
+        while (starts[i++] & 0x80 && i < size && shift < 64);
+        if (!delta) break;
+        address += delta;
+        if (address > offset) { *end = address; return start; }
+        start = address;
+    }
+    *end = 0;
+    return 0;
+}
+
+/* iOS 12 misd asks CoreTelephony whether the carrier allows tethering in one
+ * C function, `int check(int, Boolean *data_plan_enabled)`. It logs "carrier
+ * service is %savailable" and fails with 45 (`mov wN, #0x2d`) without a
+ * carrier. With __TEXT at offset 0, returns that function's offset, or 0. */
+static uint64_t share_carrier_check(const uint32_t *w, size_t count, const uint8_t *starts, size_t starts_size,
+                                   uint64_t message) {
+    size_t first = 0, last = 0;
+    uint64_t end = 0;
+    if (!message || !share_references(w, count, 0, message, &first, &last)) return 0;
+    uint64_t start = share_function_start(starts, starts_size, first * 4, &end);
+    if (!start || !end || last * 4 >= end || end / 4 > count) return 0;
+    for (size_t i = start / 4; i < end / 4; i++)
+        if ((w[i] & 0xffffffe0u) == 0x528005a0u) return start;
     return 0;
 }
 
