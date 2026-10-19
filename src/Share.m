@@ -18,6 +18,9 @@
 #include <libkern/OSCacheControl.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
+#ifdef SHARE_ROOTHIDE
+#include <glob.h>
+#endif
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/socket.h>
@@ -78,6 +81,40 @@ static NSDictionary *hotspot_state(void) {
  * Substrate, libhooker and ElleKit each expose some of these. */
 static NSString *patch_method = @"none", *hook_method = @"none";
 
+#ifdef SHARE_ROOTHIDE
+/* RootHide has no /var/jb: the jailbreak lives in a per-device random
+ * .jbroot-XXXXXXXXXXXXXXXX directory, found from this dylib's own path or
+ * by looking in the app bundle container. */
+static const char *jbroot(void) {
+    static char root[PATH_MAX];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Dl_info info;
+        const char *marker;
+        if (dladdr((const void *)jbroot, &info) && info.dli_fname && (marker = strstr(info.dli_fname, "/.jbroot-"))) {
+            const char *end = strchr(marker + 1, '/');
+            size_t length = end ? (size_t)(end - info.dli_fname) : strlen(info.dli_fname);
+            if (length < sizeof root) { memcpy(root, info.dli_fname, length); root[length] = 0; return; }
+        }
+        static const char *patterns[] = {"/var/containers/Bundle/Application/.jbroot-*",
+            "/private/var/containers/Bundle/Application/.jbroot-*", NULL};
+        for (const char **pattern = patterns; !root[0] && *pattern; pattern++) {
+            glob_t found;
+            if (glob(*pattern, 0, NULL, &found) == 0) {
+                for (size_t i = 0; !root[0] && i < found.gl_pathc; i++) {
+                    char lib[PATH_MAX];
+                    struct stat st;
+                    snprintf(lib, sizeof lib, "%s/usr/lib", found.gl_pathv[i]);
+                    if (!stat(lib, &st) && S_ISDIR(st.st_mode)) strlcpy(root, found.gl_pathv[i], sizeof root);
+                }
+            }
+            globfree(&found);
+        }
+    });
+    return root;
+}
+#endif
+
 static void *hook_symbol(const char *name) {
     static const char *libraries[] = {
         "/usr/lib/libellekit.dylib", "/var/jb/usr/lib/libellekit.dylib",
@@ -92,6 +129,17 @@ static void *hook_symbol(const char *name) {
         void *library = dlopen(*path, RTLD_NOW);
         if (library) symbol = dlsym(library, name);
     }
+#ifdef SHARE_ROOTHIDE
+    const char *root = jbroot();
+    for (const char **path = libraries; !symbol && root[0] && *path; path++) {
+        if (!strncmp(*path, "/var/jb/", 8)) continue;
+        char full[PATH_MAX];
+        snprintf(full, sizeof full, "%s%s", root, *path);
+        if (access(full, R_OK)) continue;
+        void *library = dlopen(full, RTLD_NOW);
+        if (library) symbol = dlsym(library, name);
+    }
+#endif
     return symbol;
 }
 
