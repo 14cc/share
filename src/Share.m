@@ -159,7 +159,9 @@ static BOOL hook_function(void *target, void *replacement, void **original) {
     int (*lh_functions)(void *, int) = hook_symbol("LHHookFunctions");
     if (ms_function) ms_function(target, replacement, original);
     if (*original) { hook_method = @"MSHookFunction"; return YES; }
-    if (lh_functions && lh_functions(&hook, 1) == 1 && *original) { hook_method = @"LHHookFunctions"; return YES; }
+    /* libhooker returns the hook count, Sonar returns 0: trust the original. */
+    if (!ms_function && lh_functions) lh_functions(&hook, 1);
+    if (*original) { hook_method = @"LHHookFunctions"; return YES; }
     return NO;
 }
 
@@ -359,12 +361,14 @@ static void install(void) {
     if (!local_dhcp) { failure = @"Local hotspot mode not found"; return; }
     if (!permission) { failure = @"Cellular check not recognized"; return; }
     if (!mode_lookup) { failure = @"Hotspot mode lookup not found"; return; }
+    /* Hook before patching: Sonar's first hook fails after an MSHookMemory.
+     * mode_get passes values through until misd is marked compatible. */
+    if (!hook_function(mode_lookup, (void *)mode_get, (void **)&mode_original)) { failure = @"Hooking framework unavailable"; return; }
     if (!write_instruction(text + site * 4, share_patched_instruction(destination))) { failure = @"Could not patch misd"; return; }
     if (requests == 1 && sim_absent() && write_instructions(text + request_site * 4, request_patch, 4)) {
         binary[@"requestGateOffset"] = @((uintptr_t)(text + request_site * 4) - (uintptr_t)header);
         reset_saved_state();
     }
-    if (!hook_function(mode_lookup, (void *)mode_get, (void **)&mode_original)) { failure = @"Hooking framework unavailable"; return; }
     if (ct_backend) ct_original = (void *)method_setImplementation(method, (IMP)ct_status);
     compatible = !ct_backend || ct_original != NULL;
     if (!compatible) { failure = @"Could not adapt the cellular check"; return; }
