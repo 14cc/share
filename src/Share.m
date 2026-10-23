@@ -183,18 +183,22 @@ static BOOL has_baseband(void) {
 /* misd restores its saved state at launch and skips the request gate when
  * that state is already AUTH_UNKNOWN (1021), so a device that once stopped
  * there (any build without the request-gate patch) stays there. Start such a
- * device from RESET instead; misd reads the file after this constructor. */
-static void reset_saved_state(void) {
+ * device from RESET instead. A hotspot saved as ON comes back without a SIM
+ * as ON with no network, so it starts OFF and is turned on again normally.
+ * misd reads the file after this constructor. */
+static void reset_saved_state(BOOL request_gate) {
     NSData *data = [NSData dataWithContentsOfFile:@MIS_SETTINGS];
     if (!data) return;
     NSPropertyListFormat format = NSPropertyListBinaryFormat_v1_0;
     NSMutableDictionary *settings = [NSPropertyListSerialization propertyListWithData:data
         options:NSPropertyListMutableContainers format:&format error:NULL];
-    if (![settings isKindOfClass:[NSMutableDictionary class]] ||
-        [settings[@"State"] intValue] != MIS_STATE_RESETTING) return;
+    if (![settings isKindOfClass:[NSMutableDictionary class]]) return;
+    int saved = [settings[@"State"] intValue];
+    if (saved == MIS_STATE_RESETTING && request_gate) settings[@"State"] = @(MIS_STATE_RESET);
+    else if (saved == MIS_STATE_ON) settings[@"State"] = @(MIS_STATE_OFF);
+    else return;
     struct stat info;
     if (stat(MIS_SETTINGS, &info) != 0) return;
-    settings[@"State"] = @(MIS_STATE_RESET);
     NSData *updated = [NSPropertyListSerialization dataWithPropertyList:settings format:format options:0 error:NULL];
     if (![updated writeToFile:@MIS_SETTINGS atomically:YES]) return;
     chown(MIS_SETTINGS, info.st_uid, info.st_gid);
@@ -207,7 +211,9 @@ static BOOL hook_function(void *target, void *replacement, void **original) {
     int (*lh_functions)(void *, int) = hook_symbol("LHHookFunctions");
     if (ms_function) ms_function(target, replacement, original);
     if (*original) { hook_method = @"MSHookFunction"; return YES; }
-    if (lh_functions && lh_functions(&hook, 1) == 1 && *original) { hook_method = @"LHHookFunctions"; return YES; }
+    /* libhooker returns the hook count, Sonar returns 0: trust the original. */
+    if (!ms_function && lh_functions) lh_functions(&hook, 1);
+    if (*original) { hook_method = @"LHHookFunctions"; return YES; }
     return NO;
 }
 
@@ -407,12 +413,16 @@ static void install(void) {
     if (!local_dhcp) { failure = @"Local hotspot mode not found"; return; }
     if (!permission) { failure = @"Cellular check not recognized"; return; }
     if (!mode_lookup) { failure = @"Hotspot mode lookup not found"; return; }
+    /* Hook before patching: Sonar's first hook fails after an MSHookMemory.
+     * mode_get passes values through until misd is marked compatible. */
+    if (!hook_function(mode_lookup, (void *)mode_get, (void **)&mode_original)) { failure = @"Hooking framework unavailable"; return; }
     if (!write_instruction(text + site * 4, share_patched_instruction(destination))) { failure = @"Could not patch misd"; return; }
+    BOOL request_gate = NO;
     if (requests == 1 && sim_absent() && write_instructions(text + request_site * 4, request_patch, 4)) {
         binary[@"requestGateOffset"] = @((uintptr_t)(text + request_site * 4) - (uintptr_t)header);
-        reset_saved_state();
+        request_gate = YES;
     }
-    if (!hook_function(mode_lookup, (void *)mode_get, (void **)&mode_original)) { failure = @"Hooking framework unavailable"; return; }
+    if (sim_absent()) reset_saved_state(request_gate);
     if (ct_backend) ct_original = (void *)method_setImplementation(method, (IMP)ct_status);
     compatible = !ct_backend || ct_original != NULL;
     if (!compatible) { failure = @"Could not adapt the cellular check"; return; }
